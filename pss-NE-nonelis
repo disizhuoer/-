@@ -1,0 +1,1646 @@
+#include <Encoder.h>
+#include <Wire.h>
+#include <Adafruit_Sensor.h>
+#include <Adafruit_BNO055.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+#include <TimerOne.h>
+#include <SoftwareSerial.h>
+
+/* -------------------------- 硬件引脚定义 -------------------------- */
+// 电机驱动引脚
+#define PWMA 6 // 左电机 PWM
+#define IN1 2 // 左电机方向 1
+#define IN2 3 // 左电机方向 2
+#define PWMB 7 // 右电机 PWM
+#define IN3 4 // 右电机方向 1
+#define IN4 5 // 右电机方向 2
+
+// 编码器引脚（外部中断）
+#define ENC_LEFT_A 18 // INT4
+#define ENC_LEFT_B 19
+#define ENC_RIGHT_A 20 // INT5
+#define ENC_RIGHT_B 21
+
+// 灰度传感器（5 路）
+const byte GRAY_PINS [5] = {A0, A1, A2, A3, A4};
+const int GRAY_COUNT = 5;
+
+// 环境传感器
+#define LIGHT_SENSOR A5 // 光线传感器
+#define MOISTURE_PIN A6 // 湿度传感器
+#define BATTERY_PIN A9 // 电池电压检测
+
+// 超声波（2 路）
+#define TRIG1 12 // 前向触发
+#define ECHO1 13 // 前向回声
+#define TRIG2 14 // 侧向触发
+#define ECHO2 15 // 侧向回声
+
+// 交互硬件
+#define BUZZER_PIN 8 // 蜂鸣器
+#define OLED_RESET 9 // OLED 复位
+#define LED_RUN 13 // 运行状态 LED
+#define LED_ERROR 16 // 错误状态 LED
+#define MODE_BUTTON 23 // 模式切换按钮
+
+// 与 STM32 通信（软串口 - 高优先级）
+#define STM32_TX 22 // 发送到 STM32
+#define STM32_RX 24 // 接收来自 STM32
+
+/* -------------------------- 核心参数配置 -------------------------- */
+// 运动参数
+const int MOVE_BASE_SPEED = 220; // 移动模式基础速度
+const int TRACK_BASE_SPEED = 180; // 追踪模式基础速度
+const int DRAW_BASE_SPEED = 80; // 绘图模式基础速度
+const int MIN_SPEED = 50; // 最小速度（防堵转）
+const int MAX_SPEED = 255; // 最大 PWM 值
+const unsigned long LOOP_INTERVAL = 10; // 控制环周期（10ms）
+
+// 机械参数
+const float WHEEL_CIRCUMFERENCE = 15.7; // 轮子周长 (cm)
+const int ENC_TOTAL_PULSE = 1600; // 编码器每圈脉冲数
+const float WHEEL_BASE = 12.0; // 轮距 (cm)
+
+// 传感器参数
+const int LIGHT_THRESHOLD = 300; // 光线阈值
+const int MOISTURE_THRESHOLD = 600; // 湿度阈值
+const int GRAY_THRESHOLD_DARK = 500; // 黑暗环境灰度阈值
+const int GRAY_THRESHOLD_BRIGHT = 800; // 明亮环境灰度阈值
+
+// PID 基础参数（模糊 PID 的基准值）
+const float MOVE_TURN_KP = 3.0, MOVE_TURN_KD = 2.5;
+const float TRACK_TURN_KP = 2.5, TRACK_TURN_KD = 2.0;
+const float DRAW_TURN_KP = 1.8, DRAW_TURN_KD = 3.0;
+const float MOVE_SPEED_KP = 0.7, MOVE_SPEED_KI = 0.2;
+const float TRACK_SPEED_KP = 0.9, TRACK_SPEED_KI = 0.3;
+const float DRAW_SPEED_KP = 1.2, DRAW_SPEED_KI = 0.4;
+
+// 超声波参数
+const long SONAR_TIMEOUT = 30000; // 超声波超时（30ms）
+const int OBSTACLE_THRESHOLD = 20; // 障碍物阈值 (cm)
+
+// 优化参数
+#define DEBUG_MODE 1
+const float SONAR_ALPHA = 0.3; // 超声波滤波系数
+const int TRAJECTORY_MAX = 3000; // 最大轨迹记录点
+const float EKF_POSITION_NOISE = 0.1; // EKF 位置噪声
+const float EKF_ANGLE_NOISE = 0.05; // EKF 角度噪声
+
+/* -------------------------- 优化模块结构体 -------------------------- */
+// IMU 校准结构体
+struct ImuCalibration {
+bool isCalibrated; // 是否完成校准
+float angleOffset; // 初始角度偏移
+float gyroDrift; // 陀螺仪漂移补偿
+unsigned long lastCalibTime; // 上次校准时间
+} imuCalib = {false, 0.0, 0.0, 0};
+
+// 模糊 PID 结构体
+struct FuzzyPID {
+float baseKp, baseKi, baseKd; // 基础参数
+float currentKp, currentKi, currentKd; // 动态参数
+float lastError; // 误差缓存
+} trackFuzzyPID, moveFuzzyPID, drawFuzzyPID;
+
+// 传感器健康状态结构体
+struct SensorHealth {
+bool imuOk; // IMU 是否正常
+bool encoderLeftOk, encoderRightOk; // 编码器状态
+bool grayOk; // 灰度传感器状态
+bool sonarOk; // 超声波状态
+unsigned long lastCheckTime; // 上次检测时间
+} sensorHealth = {true, true, true, true, true, 0};
+
+// 原有核心结构体
+struct KalmanFilter {
+float x; // 估计值
+float P; // 估计误差协方差
+float Q; // 过程噪声
+float R; // 测量噪声
+} grayKalman [5];
+
+struct EKFState {
+float x, y; // 坐标 (cm)
+float angle; // 角度 (弧度)
+float P [3][3] = {{1,0,0}, {0,1,0}, {0,0,1}}; // 协方差矩阵
+} ekfState;
+
+struct TrackFeature {
+int onLineCount; // 在线传感器数量
+float centerPos; // 线中心位置
+float offset; // 偏移量
+int edgeCount [2]; // 边缘计数 [右，左]
+int crossCount; // 交叉线计数
+} trackFeature;
+
+struct AvoidDecision {
+bool detected; // 是否检测到障碍
+float dist [2]; // 距离 [前向，侧向]
+int direction; // 避障方向
+unsigned long time; // 检测时间戳
+} avoidDecision = {false, {0,0}, 0, 0};
+
+struct TrajectoryPoint {
+float x, y, angle;
+unsigned long time;
+enum TrackState track;
+};
+
+/* -------------------------- 全局变量定义 -------------------------- */
+// 状态枚举
+enum EnvState {ENV_NORMAL, ENV_DARK, ENV_MOIST, ENV_DISTURB, ENV_OBSTACLE, ENV_LOW_BATTERY};
+enum TrackState { TRACK_STRAIGHT, TRACK_RIGHT_ANGLE, TRACK_LEFT_ANGLE, TRACK_SHARP_RIGHT, TRACK_SHARP_LEFT, TRACK_S, TRACK_W, TRACK_CROSS, TRACK_GAP, TRACK_UNKNOWN };
+enum SysState { SYS_INFO, SYS_TRACK, SYS_MOVE, SYS_DRAW, SYS_AVOID, SYS_LOST, SYS_RECORD, SYS_STOP, SYS_SELFTEST };
+enum OledMode { MODE_COMM, MODE_STATE, MODE_TIMER };
+
+// 状态变量
+EnvState currentEnv = ENV_NORMAL;
+TrackState currentTrack = TRACK_STRAIGHT;
+SysState currentSys = SYS_STOP;
+SysState previousSysState = SYS_STOP;
+OledMode currentOledMode = MODE_COMM;
+
+// 传感器数据
+int grayFiltered [5];
+int grayThreshold = 700; // 动态灰度阈值
+int lightValue = 0, moistureValue = 0;
+float batteryVoltage = 7.4; // 电池电压
+float sonarDistance1 = 0, sonarDistance2 = 0;
+sensors_event_t orientationData, angVelocityData;
+
+// 控制变量结构体（优化全局变量管理）
+struct ControlVars {
+// 轨迹误差相关
+float trackError;
+float trackIntegral;
+float trackDerivative;
+
+// 速度相关
+float leftSpeedTarget;
+float rightSpeedTarget;
+float leftSpeedActual;
+float rightSpeedActual;
+
+// 速度误差相关
+float leftSpeedError;
+float rightSpeedError;
+float leftSpeedIntegral;
+float rightSpeedIntegral;
+float leftSpeedDerivative;
+float rightSpeedDerivative;
+float leftLastSpeedError;
+float rightLastSpeedError;
+} controlVars = {0};
+
+// 轨迹与定位
+TrajectoryPoint trajectory [TRAJECTORY_MAX];
+int trajIndex = 0;
+float currentX = 0.0, currentY = 0.0, lastAngle = 0.0;
+float drawOriginX = 0.0, drawOriginY = 0.0; // 绘图原点
+bool isDrawingPoint = false;
+float targetDrawX = 0.0, targetDrawY = 0.0;
+
+// 辅助变量
+unsigned long lastLoopTime = 0;
+unsigned long lastLineTime = 0;
+unsigned long lastStm32Comm = 0;
+long encoderLeftLast = 0, encoderRightLast = 0;
+int trackHistory [15];
+int historyIndex = 0;
+unsigned long lastButtonPress = 0;
+unsigned long lastBatteryCheck = 0;
+bool isRecording = false;
+bool sensorUpdateFlag = false;
+unsigned long runTimer = 0;
+unsigned long timerStart = 0;
+bool isRunning = false;
+bool timerInitialized = false;
+
+// 通信缓冲区（高优先级处理）
+char stm32RxBuffer [128];
+int stm32RxIndex = 0;
+volatile bool stm32DataReady = false;
+
+/* -------------------------- 硬件对象定义 -------------------------- */
+Encoder leftEnc (ENC_LEFT_A, ENC_LEFT_B);
+Encoder rightEnc (ENC_RIGHT_A, ENC_RIGHT_B);
+Adafruit_BNO055 bno = Adafruit_BNO055 (55, 0x28);
+#define SCREEN_WIDTH 128
+#define SCREEN_HEIGHT 64
+Adafruit_SSD1306 display (SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
+SoftwareSerial STM32 (STM32_RX, STM32_TX);
+
+/* -------------------------- 中断服务程序 -------------------------- */
+// 1. 通信中断（最高优先级）
+ISR (USART0_RX_vect) {
+if (STM32.available ()) {
+char c = STM32.read ();
+if (c == '\n' || stm32RxIndex >= 127) {
+stm32RxBuffer [stm32RxIndex] = '\0';
+stm32DataReady = true;
+stm32RxIndex = 0;
+} else {
+stm32RxBuffer [stm32RxIndex++] = c;
+}
+}
+}
+
+// 2. 编码器外部中断（次高优先级）
+ISR (INT4_vect) {
+// 左编码器 A 相中断处理
+long newPos = leftEnc.read ();
+controlVars.leftSpeedActual = (newPos - encoderLeftLast) / (float) LOOP_INTERVAL;
+encoderLeftLast = newPos;
+}
+
+ISR (INT5_vect) {
+// 右编码器 A 相中断处理
+long newPos = rightEnc.read ();
+controlVars.rightSpeedActual = (newPos - encoderRightLast) / (float) LOOP_INTERVAL;
+encoderRightLast = newPos;
+}
+
+// 3. 主逻辑定时器中断（最低优先级）
+ISR (TIMER1_COMPA_vect) {
+controlLoop ();
+}
+
+/* -------------------------- 初始化函数 -------------------------- */
+void setup () {
+// 串口与引脚初始化
+Serial.begin (115200);
+STM32.begin (115200);
+
+pinMode(IN1, OUTPUT);
+pinMode(IN2, OUTPUT);
+pinMode(IN3, OUTPUT);
+pinMode(IN4, OUTPUT);
+pinMode(PWMA, OUTPUT);
+pinMode(PWMB, OUTPUT);
+pinMode(LIGHT_SENSOR, INPUT);
+pinMode(MOISTURE_PIN, INPUT);
+pinMode(BATTERY_PIN, INPUT);
+pinMode(BUZZER_PIN, OUTPUT);
+pinMode(TRIG1, OUTPUT);
+pinMode(ECHO1, INPUT);
+pinMode(TRIG2, OUTPUT);
+pinMode(ECHO2, INPUT);
+pinMode(LED_RUN, OUTPUT);
+pinMode(LED_ERROR, OUTPUT);
+pinMode(MODE_BUTTON, INPUT_PULLUP);
+for (int i = 0; i < 5; i++) pinMode(GRAY_PINS[i], INPUT);
+
+// 传感器初始化
+if (!bno.begin ()) {
+errorAlert ("BNO055 err");
+while (1);
+}
+bno.setExtCrystalUse (true);
+
+if(!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) {
+errorAlert("OLED err");
+while(1);
+}
+
+// 卡尔曼滤波器初始化
+for (int i = 0; i < 5; i++) {
+grayKalman [i].x = 0;
+grayKalman [i].P = 1.0;
+grayKalman [i].Q = 0.01;
+grayKalman [i].R = 0.5;
+}
+
+// 系统自检与校准
+systemSelfTest ();
+calibrateGraySensor ();
+calibrateEncoder ();
+calibrateImu ();
+
+// 优化模块初始化
+fuzzyPIDInit ();
+setInterruptPriority (); // 配置中断优先级（通信> 外部 > 主逻辑）
+
+// 控制环定时器
+Timer1.initialize (10000); // 10ms 中断
+Timer1.attachInterrupt (controlLoop);
+
+// 初始化完成
+updateOLED ("Ready: Press btn");
+digitalWrite (LED_RUN, HIGH);
+beep (1, 200);
+delay (1000);
+}
+
+/* -------------------------- 主循环（低优先级任务） -------------------------- */
+void loop () {
+// 处理高优先级通信中断接收的数据
+if (stm32DataReady) {
+noInterrupts (); // 临时关闭中断保证数据完整性
+String cmd = String (stm32RxBuffer);
+stm32DataReady = false;
+interrupts ();
+
+processStm32Command(cmd);
+lastStm32Comm = millis();
+}
+
+// 模式按钮检测
+checkModeButton ();
+
+// 状态上报
+if (currentSys == SYS_INFO && millis () - lastStm32Comm > 100) {
+reportStateToStm32 ();
+lastStm32Comm = millis ();
+}
+
+// 电池检测
+if (millis () - lastBatteryCheck > 1000) {
+readBatteryVoltage ();
+lastBatteryCheck = millis ();
+}
+
+// 超声波更新（耗时操作）
+static unsigned long lastSonarTime = 0;
+if (millis () - lastSonarTime > 50) {
+updateSonar ();
+sensorUpdateFlag = true;
+lastSonarTime = millis ();
+}
+
+// OLED 更新
+static unsigned long lastOledUpdate = 0;
+if (millis () - lastOledUpdate > 500) {
+updateOLEDStatus ();
+lastOledUpdate = millis ();
+}
+
+delay(10);
+}
+
+/* -------------------------- 控制环中断（主逻辑，最低优先级） -------------------------- */
+void controlLoop () {
+unsigned long currentTime = millis ();
+if (currentTime - lastLoopTime < LOOP_INTERVAL) return;
+lastLoopTime = currentTime;
+
+// 传感器数据采集
+if (sensorUpdateFlag) {
+updateNonBlockingSensors ();
+sensorUpdateFlag = false;
+}
+
+// 参数调整
+adjustGrayThreshold ();
+adjustPIDByState ();
+
+// 状态更新
+updateEnvState ();
+updateTrackState ();
+updateSysState ();
+
+// 轨迹特征
+updateTrackFeature ();
+updateTrackHistory ();
+
+// 传感器健康检查与降级
+checkSensorHealth ();
+if (!sensorHealth.imuOk || !sensorHealth.encoderLeftOk || !sensorHealth.grayOk) {
+degradeControl ();
+}
+
+// 核心控制
+switch (currentSys) {
+case SYS_TRACK: trackControl (); break;
+case SYS_MOVE: moveControl (); break;
+case SYS_DRAW: drawControl (); break;
+case SYS_AVOID: avoidControl (); break;
+case SYS_LOST: lostRecovery (); break;
+case SYS_RECORD: recordTrajectory (); moveControl (); break;
+case SYS_STOP: stopAll (); break;
+default: break;
+}
+
+// 运行计时
+updateRunTimer ();
+
+// 调试输出
+#ifdef DEBUG_MODE
+logDebugData ();
+#endif
+}
+
+/* -------------------------- 传感器与数据处理 -------------------------- */
+// 卡尔曼滤波
+float kalmanUpdate (KalmanFilter &kf, float measurement) {
+float x_pred = kf.x;
+float P_pred = kf.P + kf.Q;
+float K = P_pred / (P_pred + kf.R);
+kf.x = x_pred + K * (measurement - x_pred);
+kf.P = (1 - K) * P_pred;
+return kf.x;
+}
+
+// 非耗时传感器更新（中断调用）
+void updateNonBlockingSensors () {
+// 灰度传感器
+for (int i = 0; i < 5; i++) {
+int raw = analogRead (GRAY_PINS [i]);
+grayFiltered [i] = kalmanUpdate (grayKalman [i], raw);
+}
+
+// 环境传感器
+lightValue = analogRead (LIGHT_SENSOR);
+moistureValue = analogRead (MOISTURE_PIN);
+
+// IMU 数据（使用校准后角度）
+bno.getEvent (&orientationData, Adafruit_BNO055::VECTOR_EULER);
+bno.getEvent (&angVelocityData, Adafruit_BNO055::VECTOR_GYROSCOPE);
+}
+
+// 超声波更新
+void updateSonar () {
+float raw1 = getSonarDistance (TRIG1, ECHO1);
+float raw2 = getSonarDistance (TRIG2, ECHO2);
+
+if (raw1 > 0 && raw1 < 100) {
+sonarDistance1 = SONAR_ALPHA * raw1 + (1 - SONAR_ALPHA) * sonarDistance1;
+}
+if (raw2 > 0 && raw2 < 100) {
+sonarDistance2 = SONAR_ALPHA * raw2 + (1 - SONAR_ALPHA) * sonarDistance2;
+}
+}
+
+// 超声波距离计算
+float getSonarDistance (int trigPin, int echoPin) {
+digitalWrite (trigPin, LOW);
+delayMicroseconds (2);
+digitalWrite (trigPin, HIGH);
+delayMicroseconds (10);
+digitalWrite (trigPin, LOW);
+
+long duration = pulseIn(echoPin, HIGH, SONAR_TIMEOUT);
+float distance = duration * 0.034 / 2;
+return (distance < 0 || distance > 100) ? 100 : distance;
+}
+
+// 动态灰度阈值
+void adjustGrayThreshold () {
+int constrainedLight = constrain (lightValue, 0, 1023);
+grayThreshold = map (constrainedLight, 0, 1023, GRAY_THRESHOLD_DARK, GRAY_THRESHOLD_BRIGHT);
+
+static int lastThreshold = GRAY_THRESHOLD_BRIGHT / 2;
+if (abs(grayThreshold - lastThreshold) < 20) grayThreshold = lastThreshold;
+else lastThreshold = grayThreshold;
+}
+
+// 电池电压
+float readBatteryVoltage () {
+int raw = analogRead (BATTERY_PIN);
+float voltage = raw * (5.0 / 1023.0) * 2.0;
+
+static float smoothedVoltage = 7.4;
+smoothedVoltage = 0.8 * smoothedVoltage + 0.2 * voltage;
+batteryVoltage = constrain(smoothedVoltage, 6.0, 8.4);
+
+return batteryVoltage;
+}
+
+// 电压补偿
+float getVoltageCompensation () {
+return constrain (7.4 /batteryVoltage, 0.8, 1.2);
+}
+
+/* -------------------------- 优化模块：IMU 融合校准 -------------------------- */
+// IMU 校准
+void calibrateImu () {
+updateOLED ("Calibrating IMU...");
+unsigned long calibStart = millis ();
+uint8_t system, gyro, accel, mag;
+
+// 等待校准完成（最多 10 秒）
+while (millis () - calibStart < 10000) {
+bno.getCalibration (&system, &gyro, &accel, &mag);
+if (system >= 2 && gyro >= 2 && accel >= 2 && mag >= 2) break;
+
+// 激活校准（轻微晃动）
+if (millis () - calibStart > 3000 && millis () - calibStart < 7000) {
+setMotorSpeed (30, -30);
+delay (100);
+setMotorSpeed (0, 0);
+delay (200);
+}
+}
+
+// 记录初始偏移
+sensors_event_t initialOrient;
+bno.getEvent (&initialOrient, Adafruit_BNO055::VECTOR_EULER);
+imuCalib.angleOffset = initialOrient.orientation.x;
+imuCalib.isCalibrated = true;
+imuCalib.lastCalibTime = millis ();
+
+updateOLED("IMU calib done");
+delay(500);
+}
+
+// 校准后 IMU 角度（编码器修正）
+float getImuAngleWithCompensation () {
+if (!imuCalib.isCalibrated) {
+static unsigned long warnTime = 0;
+if (millis () - warnTime > 1000) {
+Serial.println ("IMU not calibrated!");
+warnTime = millis ();
+}
+sensors_event_t orient;
+bno.getEvent (&orient, Adafruit_BNO055::VECTOR_EULER);
+return orient.orientation.x;
+}
+
+// 原始角度（去偏移）
+sensors_event_t orient;
+bno.getEvent (&orient, Adafruit_BNO055::VECTOR_EULER);
+float rawAngle = orient.orientation.x - imuCalib.angleOffset;
+
+// 编码器角度（参考基准）
+long leftEncNow = leftEnc.read ();
+long rightEncNow = rightEnc.read ();
+float leftDist = (leftEncNow - encoderLeftLast) * WHEEL_CIRCUMFERENCE / ENC_TOTAL_PULSE;
+float rightDist = (rightEncNow - encoderRightLast) * WHEEL_CIRCUMFERENCE / ENC_TOTAL_PULSE;
+float angleFromEnc = (rightDist - leftDist) / WHEEL_BASE * RAD_TO_DEG;
+
+static float encAngleIntegral = 0;
+encAngleIntegral += angleFromEnc;
+
+// 融合（IMU 95% + 编码器 5%）
+static float imuAngleFiltered = 0;
+imuAngleFiltered = 0.95 * rawAngle + 0.05 * encAngleIntegral;
+
+// 温度漂移补偿（30 秒更新）
+if (millis () - imuCalib.lastCalibTime > 30000) {
+imuCalib.gyroDrift = (rawAngle - encAngleIntegral) * 0.1;
+imuCalib.lastCalibTime = millis ();
+}
+imuAngleFiltered -= imuCalib.gyroDrift;
+
+return imuAngleFiltered;
+}
+
+/* -------------------------- 优化模块：模糊自适应 PID -------------------------- */
+// 模糊 PID 初始化
+void fuzzyPIDInit () {
+// 追踪模式
+trackFuzzyPID.baseKp = TRACK_TURN_KP;
+trackFuzzyPID.baseKi = TRACK_SPEED_KI;
+trackFuzzyPID.baseKd = TRACK_TURN_KD;
+
+// 移动模式
+moveFuzzyPID.baseKp = MOVE_TURN_KP;
+moveFuzzyPID.baseKi = MOVE_SPEED_KI;
+moveFuzzyPID.baseKd = MOVE_TURN_KD;
+
+// 绘图模式
+drawFuzzyPID.baseKp = DRAW_TURN_KP;
+drawFuzzyPID.baseKi = DRAW_SPEED_KI;
+drawFuzzyPID.baseKd = DRAW_TURN_KD;
+}
+
+// 模糊规则调整
+void fuzzyAdjustPID (FuzzyPID &fpid, float error, float errorRate) {
+// 模糊化（映射到 [-3,3]）
+float e = constrain (error / 100.0, -3.0, 3.0);
+float ec = constrain (errorRate / 50.0, -3.0, 3.0);
+
+// Kp 调整（误差大增强响应，变化快抑制超调）
+float kpAdjust = 0;
+if (e> 2) kpAdjust = 0.3;
+else if (e > 0.5) kpAdjust = 0.1;
+else if (e < -2) kpAdjust = 0.3;
+else if (e < -0.5) kpAdjust = 0.1;
+else if (abs (ec) > 1.5) kpAdjust = -0.1;
+
+// Ki 调整（误差小增强积分）
+float kiAdjust = 0;
+if (abs (e) < 0.5) kiAdjust = 0.2;
+else if (abs (e) > 2) kiAdjust = -0.5;
+else if (abs (ec) > 2) kiAdjust = -0.3;
+
+// Kd 调整（变化快增强阻尼）
+float kdAdjust = 0;
+if (abs (ec) > 2) kdAdjust = 0.3;
+else if (abs (ec) > 0.8) kdAdjust = 0.1;
+else if (abs (e) > 2) kdAdjust = -0.2;
+
+// 动态参数（带边界）
+fpid.currentKp = constrain (fpid.baseKp * (1 + kpAdjust), fpid.baseKp * 0.5, fpid.baseKp * 1.5);
+fpid.currentKi = constrain (fpid.baseKi * (1 + kiAdjust), 0, fpid.baseKi * 2.0);
+fpid.currentKd = constrain (fpid.baseKd * (1 + kdAdjust), fpid.baseKd * 0.5, fpid.baseKd * 2.0);
+}
+
+// PID 参数调整
+void adjustPIDByState () {
+switch (currentSys) {
+case SYS_TRACK: {
+float error = controlVars.trackError;
+float errorRate = (error - trackFuzzyPID.lastError) / (LOOP_INTERVAL / 1000.0);
+fuzzyAdjustPID (trackFuzzyPID, error, errorRate);
+break;
+}
+case SYS_MOVE: {
+float error = controlVars.trackError;
+float errorRate = (error - moveFuzzyPID.lastError) / (LOOP_INTERVAL / 1000.0);
+fuzzyAdjustPID (moveFuzzyPID, error, errorRate);
+break;
+}
+case SYS_DRAW: {
+float error = controlVars.trackError;
+float errorRate = (error - drawFuzzyPID.lastError) / (LOOP_INTERVAL / 1000.0);
+fuzzyAdjustPID (drawFuzzyPID, error, errorRate);
+break;
+}
+default: break;
+}
+
+// 环境补偿
+if (currentEnv == ENV_DARK || currentEnv == ENV_DISTURB) {
+if (currentSys == SYS_TRACK) trackFuzzyPID.currentKp *= 0.8;
+else if (currentSys == SYS_MOVE) moveFuzzyPID.currentKp *= 0.8;
+}
+}
+
+/* -------------------------- 优化模块：传感器健康与降级 -------------------------- */
+// 传感器健康检查
+void checkSensorHealth () {
+unsigned long now = millis ();
+if (now - sensorHealth.lastCheckTime < 100) return;
+sensorHealth.lastCheckTime = now;
+
+// IMU 检测（角度跳变）
+static float lastImuAngle = 0;
+float currentImuAngle = getImuAngleWithCompensation ();
+if (abs (currentImuAngle - lastImuAngle) > 30) {
+sensorHealth.imuOk = false;
+errorAlert ("IMU err");
+} else {
+sensorHealth.imuOk = imuCalib.isCalibrated;
+}
+lastImuAngle = currentImuAngle;
+
+// 编码器检测（无脉冲）
+static long lastLeftEnc = 0, lastRightEnc = 0;
+long currentLeftEnc = leftEnc.read ();
+long currentRightEnc = rightEnc.read ();
+
+if (abs(currentLeftEnc - lastLeftEnc) < 1 && abs(controlVars.leftSpeedTarget) > 50) {
+sensorHealth.encoderLeftOk = false;
+errorAlert("LeftEnc err");
+} else sensorHealth.encoderLeftOk = true;
+
+if (abs(currentRightEnc - lastRightEnc) < 1 && abs(controlVars.rightSpeedTarget) > 50) {
+sensorHealth.encoderRightOk = false;
+errorAlert("RightEnc err");
+} else sensorHealth.encoderRightOk = true;
+
+lastLeftEnc = currentLeftEnc;
+lastRightEnc = currentRightEnc;
+
+// 灰度检测（有效传感器数量）
+int grayActive = 0;
+for (int i = 0; i < 5; i++) {
+if (grayFiltered [i] > 100 && grayFiltered [i] < 900) grayActive++;
+}
+sensorHealth.grayOk = (grayActive >= 2);
+
+// 超声波检测（连续超时）
+static int sonarTimeoutCount = 0;
+if (sonarDistance1> 99 || sonarDistance2 > 99) {
+sonarTimeoutCount++;
+if (sonarTimeoutCount > 5) {
+sensorHealth.sonarOk = false;
+sonarTimeoutCount = 0;
+}
+} else {
+sensorHealth.sonarOk = true;
+sonarTimeoutCount = 0;
+}
+}
+
+// 故障降级
+void degradeControl () {
+// IMU 故障→增强编码器 + 灰度权重
+if (!sensorHealth.imuOk) {
+ekfState.angle = (rightEnc.read () - leftEnc.read ()) * WHEEL_CIRCUMFERENCE / (ENC_TOTAL_PULSE * WHEEL_BASE) * RAD_TO_DEG;
+controlVars.trackError = calculateTrackError () * 1.5;
+}
+
+// 编码器故障→减速 + 禁用速度闭环
+if (!sensorHealth.encoderLeftOk || !sensorHealth.encoderRightOk) {
+controlVars.leftSpeedTarget = constrain (controlVars.leftSpeedTarget, MIN_SPEED, MAX_SPEED * 0.7);
+controlVars.rightSpeedTarget = constrain (controlVars.rightSpeedTarget, MIN_SPEED, MAX_SPEED * 0.7);
+}
+
+// 灰度故障→沿记录轨迹移动
+if (!sensorHealth.grayOk) {
+currentSys = SYS_MOVE;
+if (trajIndex > 0) {
+static int followIndex = 0;
+if (followIndex < trajIndex) {
+executePreciseMove (trajectory [followIndex].x, trajectory [followIndex].y);
+followIndex++;
+}
+}
+}
+
+// 超声波故障→用灰度边缘避障
+if (!sensorHealth.sonarOk) {
+avoidDecision.detected = false;
+if (grayFiltered [0] < grayThreshold || grayFiltered [4] < grayThreshold) {
+avoidDecision.detected = true;
+avoidDecision.direction = 1;
+}
+}
+}
+
+/* -------------------------- 优化模块：中断优先级与 EKF 增强 -------------------------- */
+// 中断优先级设置（按要求：1. 通信 2. 外部中断 3. 主逻辑）
+void setInterruptPriority () {
+#if defined (AVR_ATmega2560)
+// 1. 通信中断（最高优先级）- UART0 接收中断
+UCSR0B &= ~(1 << RXCIE0); // 先禁用
+UCSR0A |= (1 << RXC0); // 清除接收标志
+UCSR0B |= (1 << RXCIE0); // 使能中断（最高优先级）
+
+// 2. 外部中断（次高优先级）- 编码器中断
+EIMSK &= ~((1 << INT4) | (1 << INT5)); // 先禁用
+EICRB |= (1 << ISC40) | (1 << ISC50); // 任意沿触发
+EIMSK |= (1 << INT4) | (1 << INT5); // 使能中断（次高优先级）
+
+// 3. 主逻辑中断（最低优先级）- Timer1
+TIMSK1 &= ~(1 << OCIE1A); // 先禁用
+ICR1 = 0xFFFF;
+TCCR1B = (1 << WGM13) | (1 << CS11); // 配置定时器
+TIMSK1 |= (1 << OCIE1A); // 使能中断（最低优先级）
+#endif
+}
+
+// EKF 预测
+void ekfPredict (float encoderDist, float imuAngle) {
+ekfState.x += encoderDist * cos (imuAngle);
+ekfState.y += encoderDist * sin (imuAngle);
+ekfState.angle = imuAngle;
+
+float distanceFactor = min(encoderDist, 10.0);
+ekfState.P[0][0] += EKF_POSITION_NOISE * distanceFactor;
+ekfState.P[1][1] += EKF_POSITION_NOISE * distanceFactor;
+
+float angularFactor = abs(angVelocityData.gyro.x);
+ekfState.P[2][2] += EKF_ANGLE_NOISE * angularFactor * (LOOP_INTERVAL / 1000.0);
+}
+
+// EKF 更新（增强版）
+void ekfUpdate (float encoderDist, float imuAngle) {
+ekfPredict (encoderDist, imuAngle);
+
+// 直线轨迹约束（修正横向漂移）
+if (currentTrack == TRACK_STRAIGHT && sensorHealth.grayOk) {
+static float straightY = ekfState.y;
+if (abs (trackFeature.offset) < 30) {
+float yError = straightY - ekfState.y;
+ekfState.y += yError * 0.1;
+ekfState.P [1][1] *= 0.5;
+} else straightY = ekfState.y;
+}
+
+// 预设轨迹匹配（绘图模式）
+if (currentSys == SYS_DRAW && trajIndex> 0) {
+int closestIndex = 0;
+float minDist = 1000;
+for (int i = 0; i < trajIndex; i++) {
+float dist = sqrt (pow (ekfState.x - trajectory [i].x, 2) + pow (ekfState.y - trajectory [i].y, 2));
+if (dist < minDist) {
+minDist = dist;
+closestIndex = i;
+}
+}
+if (minDist > 3.0) {
+ekfState.x = ekfState.x * 0.8 + trajectory [closestIndex].x * 0.2;
+ekfState.y = ekfState.y * 0.8 + trajectory [closestIndex].y * 0.2;
+}
+}
+
+// 位置跳变过滤
+static float lastX = 0, lastY = 0;
+float xDiff = abs (ekfState.x - lastX);
+float yDiff = abs (ekfState.y - lastY);
+if (xDiff > 5 || yDiff > 5) {
+ekfState.x = lastX * 0.7 + ekfState.x * 0.3;
+ekfState.y = lastY * 0.7 + ekfState.y * 0.3;
+}
+lastX = ekfState.x;
+lastY = ekfState.y;
+
+// 协方差修正
+ekfState.P [0][0] = max (ekfState.P [0][0], 0.1);
+ekfState.P [1][1] = max (ekfState.P [1][1], 0.1);
+ekfState.P [2][2] = max (ekfState.P [2][2], 0.05);
+}
+
+// 位置更新
+void updatePosition () {
+long leftEncNow = leftEnc.read ();
+long rightEncNow = rightEnc.read ();
+float leftDist = (leftEncNow - encoderLeftLast) * WHEEL_CIRCUMFERENCE / ENC_TOTAL_PULSE;
+float rightDist = (rightEncNow - encoderRightLast) * WHEEL_CIRCUMFERENCE / ENC_TOTAL_PULSE;
+float distance = (leftDist + rightDist) / 2.0;
+
+float currentAngle = getImuAngleWithCompensation() * DEG_TO_RAD;
+ekfUpdate(distance, currentAngle);
+
+// 绘图模式用相对坐标
+if (currentSys == SYS_DRAW) {
+currentX = ekfState.x - drawOriginX;
+currentY = ekfState.y - drawOriginY;
+} else {
+currentX = ekfState.x;
+currentY = ekfState.y;
+}
+lastAngle = ekfState.angle;
+}
+
+/* -------------------------- 状态机与控制逻辑 -------------------------- */
+// 环境状态
+void updateEnvState () {
+if (batteryVoltage < 6.3) {
+currentEnv = ENV_LOW_BATTERY;
+return;
+}
+
+bool obstacleFromSonar = (sonarDistance1 < OBSTACLE_THRESHOLD || sonarDistance2 < OBSTACLE_THRESHOLD) && sonarDistance1 > 0 && sonarDistance2 > 0;
+if (obstacleFromSonar) {
+avoidDecision.detected = true;
+avoidDecision.dist[0] = sonarDistance1;
+avoidDecision.dist[1] = sonarDistance2;
+avoidDecision.time = millis();
+currentEnv = ENV_OBSTACLE;
+return;
+} else avoidDecision.detected = false;
+
+if (lightValue < LIGHT_THRESHOLD) currentEnv = ENV_DARK;
+else if (moistureValue > MOISTURE_THRESHOLD) currentEnv = ENV_MOIST;
+else {
+bool isDisturb = false;
+for (int i = 0; i < 4; i++) {
+if (abs(grayFiltered[i] - grayFiltered[i+1]) > 300) {
+isDisturb = true;
+break;
+}
+}
+currentEnv = isDisturb ? ENV_DISTURB : ENV_NORMAL;
+}
+}
+
+// 轨迹状态
+void updateTrackState () {
+if (trackFeature.crossCount>= 3) {
+currentTrack = TRACK_CROSS;
+return;
+}
+
+if (trackFeature.onLineCount == 0 && millis() - lastLineTime < 500) {
+currentTrack = TRACK_GAP;
+return;
+}
+
+if (trackFeature.edgeCount[0] >= 4 && trackFeature.offset > 80) {
+currentTrack = (trackFeature.offset > 150) ? TRACK_SHARP_RIGHT : TRACK_RIGHT_ANGLE;
+return;
+}
+
+if (trackFeature.edgeCount[1] >= 4 && trackFeature.offset < -80) {
+currentTrack = (trackFeature.offset < -150) ? TRACK_SHARP_LEFT : TRACK_LEFT_ANGLE;
+return;
+}
+
+int edgeChanges = 0;
+for (int i = 1; i < 5; i++) {
+int prev = trackHistory[(historyIndex + i - 1) % 15];
+int curr = trackHistory[(historyIndex + i) % 15];
+if ((prev == TRACK_RIGHT_ANGLE && curr == TRACK_LEFT_ANGLE) || (prev == TRACK_LEFT_ANGLE && curr == TRACK_RIGHT_ANGLE)) {
+edgeChanges++;
+}
+}
+
+if (edgeChanges >= 2 && abs(trackFeature.offset) < 100) {
+currentTrack = TRACK_S;
+return;
+}
+
+if (edgeChanges >= 3 && abs(trackFeature.offset) < 120) {
+currentTrack = TRACK_W;
+return;
+}
+
+if (abs(trackFeature.offset) < 50) currentTrack = TRACK_STRAIGHT;
+else currentTrack = TRACK_UNKNOWN;
+}
+
+// 系统状态
+void updateSysState () {
+if (currentEnv == ENV_LOW_BATTERY) {
+currentSys = SYS_STOP;
+errorAlert ("Low battery");
+return;
+}
+
+if (currentEnv == ENV_OBSTACLE && currentSys != SYS_STOP && currentSys != SYS_AVOID) {
+previousSysState = currentSys;
+currentSys = SYS_AVOID;
+return;
+}
+
+bool lineFound = (trackFeature.onLineCount > 0);
+if (lineFound) lastLineTime = millis();
+else if (millis() - lastLineTime > 1000 && currentSys != SYS_STOP && currentSys != SYS_AVOID) {
+currentSys = SYS_LOST;
+return;
+}
+}
+
+// 轨迹特征
+void updateTrackFeature () {
+trackFeature.onLineCount = 0;
+trackFeature.centerPos = 0;
+
+for (int i = 0; i < 5; i++) {
+if (grayFiltered[i] > grayThreshold) {
+trackFeature.onLineCount++;
+trackFeature.centerPos += i * 100;
+}
+}
+
+trackFeature.centerPos = (trackFeature.onLineCount > 0) ? (trackFeature.centerPos / trackFeature.onLineCount) : 200;
+trackFeature.offset = trackFeature.centerPos - 200;
+
+if (grayFiltered[0] > grayThreshold) {
+trackFeature.edgeCount[0]++;
+trackFeature.edgeCount[1] = 0;
+} else if (grayFiltered[4] > grayThreshold) {
+trackFeature.edgeCount[1]++;
+trackFeature.edgeCount[0] = 0;
+} else {
+trackFeature.edgeCount[0] = max(0, trackFeature.edgeCount[0] - 1);
+trackFeature.edgeCount[1] = max(0, trackFeature.edgeCount[1] - 1);
+}
+
+trackFeature.crossCount = (trackFeature.onLineCount >= 4) ? (trackFeature.crossCount + 1) : max(0, trackFeature.crossCount - 1);
+}
+
+// 轨迹历史
+void updateTrackHistory () {
+trackHistory [historyIndex] = currentTrack;
+historyIndex = (historyIndex + 1) % 15;
+}
+
+// 循迹控制
+void trackControl () {
+controlVars.trackError = calculateTrackError ();
+float dt = LOOP_INTERVAL / 1000.0;
+
+// 积分分离
+if (abs (controlVars.trackError) < 800) {
+controlVars.trackIntegral += controlVars.trackError * dt * trackFuzzyPID.currentKi;
+controlVars.trackIntegral = constrain (controlVars.trackIntegral, -500, 500);
+} else controlVars.trackIntegral = 0;
+
+controlVars.trackDerivative = (controlVars.trackError - trackFuzzyPID.lastError) / dt;
+float turnControl = trackFuzzyPID.currentKp * controlVars.trackError + controlVars.trackIntegral + trackFuzzyPID.currentKd * controlVars.trackDerivative;
+trackFuzzyPID.lastError = controlVars.trackError;
+
+= controlVars.trackError;
+
+int baseSpeed = TRACK_BASE_SPEED;
+if (currentTrack == TRACK_SHARP_RIGHT || currentTrack == TRACK_SHARP_LEFT) baseSpeed *= 0.6;
+else if (currentTrack == TRACK_RIGHT_ANGLE || currentTrack == TRACK_LEFT_ANGLE) baseSpeed *= 0.7;
+baseSpeed = constrain(baseSpeed, MIN_SPEED, MAX_SPEED);
+
+int speedDiff = constrain(turnControl / 25, -80, 80);
+controlVars.leftSpeedTarget = baseSpeed + speedDiff;
+controlVars.rightSpeedTarget = baseSpeed - speedDiff;
+
+speedLoopControl(dt);
+}
+
+// 移动控制
+void moveControl () {
+controlVars.trackError = calculateTrackError ();
+float dt = LOOP_INTERVAL / 1000.0;
+
+controlVars.trackDerivative = (controlVars.trackError - moveFuzzyPID.lastError) / dt;
+float turnControl = moveFuzzyPID.currentKp * controlVars.trackError + moveFuzzyPID.currentKd * controlVars.trackDerivative;
+moveFuzzyPID.lastError = controlVars.trackError;
+
+int baseSpeed = MOVE_BASE_SPEED;
+float turnFactor = 1.0 - min(abs(controlVars.trackError) / 2000.0, 0.5);
+baseSpeed *= turnFactor;
+baseSpeed = constrain(baseSpeed, MIN_SPEED, MAX_SPEED);
+
+int speedDiff = constrain(turnControl / 30, -100, 100);
+controlVars.leftSpeedTarget = baseSpeed + speedDiff;
+controlVars.rightSpeedTarget = baseSpeed - speedDiff;
+
+speedLoopControl(dt);
+}
+
+// 绘图控制
+void drawControl () {
+if (isDrawingPoint) {
+float dx = targetDrawX - currentX;
+float dy = targetDrawY - currentY;
+float distToTarget = sqrt (dxdx + dydy);
+float targetAngle = atan2(dy, dx) * RAD_TO_DEG;
+
+float angleDiff = targetAngle - getImuAngleWithCompensation();
+angleDiff = (angleDiff > 180) ? angleDiff - 360 : (angleDiff < -180) ? angleDiff + 360 : angleDiff;
+
+if (distToTarget < 0.5 && abs(angleDiff) < 2) {
+controlVars.leftSpeedTarget = 0;
+controlVars.rightSpeedTarget = 0;
+speedLoopControl(LOOP_INTERVAL / 1000.0);
+
+static unsigned long lastNotify = 0;
+if (millis() - lastNotify > 200) {
+STM32.println("READY:DRAW");
+lastNotify = millis();
+}
+return;
+}
+
+controlVars.trackError = angleDiff * 10;
+float dt = LOOP_INTERVAL / 1000.0;
+
+controlVars.trackDerivative = (controlVars.trackError - drawFuzzyPID.lastError) / dt;
+float turnControl = drawFuzzyPID.currentKp * controlVars.trackError + drawFuzzyPID.currentKd * controlVars.trackDerivative;
+drawFuzzyPID.lastError = controlVars.trackError;
+
+int baseSpeed = map(distToTarget, 0, 10, MIN_SPEED, DRAW_BASE_SPEED);
+baseSpeed = constrain(baseSpeed, MIN_SPEED, DRAW_BASE_SPEED);
+
+int speedDiff = constrain(turnControl / 40, -50, 50);
+controlVars.leftSpeedTarget = baseSpeed + speedDiff;
+controlVars.rightSpeedTarget = baseSpeed - speedDiff;
+
+speedLoopControl(dt);
+return;
+}
+
+controlVars.trackError = calculateTrackError();
+float dt = LOOP_INTERVAL / 1000.0;
+
+controlVars.trackIntegral += controlVars.trackError * dt * drawFuzzyPID.currentKi;
+controlVars.trackIntegral = constrain(controlVars.trackIntegral, -300, 300);
+
+controlVars.trackDerivative = (controlVars.trackError - drawFuzzyPID.lastError) / dt;
+float turnControl = drawFuzzyPID.currentKp * controlVars.trackError + controlVars.trackIntegral + drawFuzzyPID.currentKd * controlVars.trackDerivative;
+drawFuzzyPID.lastError = controlVars.trackError;
+
+int baseSpeed = DRAW_BASE_SPEED;
+float turnFactor = 1.0 - min(abs(controlVars.trackError) / 1000.0, 0.7);
+baseSpeed *= turnFactor;
+baseSpeed = constrain(baseSpeed, MIN_SPEED, DRAW_BASE_SPEED * 1.2);
+
+int speedDiff = constrain(turnControl / 40, -50, 50);
+controlVars.leftSpeedTarget = baseSpeed + speedDiff;
+controlVars.rightSpeedTarget = baseSpeed - speedDiff;
+
+speedLoopControl(dt);
+}
+
+// 速度闭环
+void speedLoopControl (float dt) {
+controlVars.leftSpeedError = controlVars.leftSpeedTarget - controlVars.leftSpeedActual;
+float leftPwm = (MOVE_SPEED_KP * controlVars.leftSpeedError + MOVE_SPEED_KI * controlVars.leftSpeedIntegral + MOVE_SPEED_KD * controlVars.leftSpeedDerivative) * getVoltageCompensation ();
+
+if (abs(leftPwm) < MAX_SPEED && abs(controlVars.leftSpeedError) < 50) {
+controlVars.leftSpeedIntegral += controlVars.leftSpeedError * dt;
+controlVars.leftSpeedIntegral = constrain(controlVars.leftSpeedIntegral, -300, 300);
+} else controlVars.leftSpeedIntegral *= 0.9;
+
+controlVars.leftSpeedDerivative = (controlVars.leftSpeedError - controlVars.leftLastSpeedError) / dt;
+controlVars.leftLastSpeedError = controlVars.leftSpeedError;
+
+controlVars.rightSpeedError = controlVars.rightSpeedTarget - controlVars.rightSpeedActual;
+float rightPwm = (MOVE_SPEED_KP * controlVars.rightSpeedError + MOVE_SPEED_KI * controlVars.rightSpeedIntegral + MOVE_SPEED_KD * controlVars.rightSpeedDerivative) * getVoltageCompensation();
+
+if (abs(rightPwm) < MAX_SPEED && abs(controlVars.rightSpeedError) < 50) {
+controlVars.rightSpeedIntegral += controlVars.rightSpeedError * dt;
+controlVars.rightSpeedIntegral = constrain(controlVars.rightSpeedIntegral, -300, 300);
+} else controlVars.rightSpeedIntegral *= 0.9;
+
+controlVars.rightSpeedDerivative = (controlVars.rightSpeedError - controlVars.rightLastSpeedError) / dt;
+controlVars.rightLastSpeedError = controlVars.rightSpeedError;
+
+setMotorSpeed(constrain(leftPwm, -MAX_SPEED, MAX_SPEED), constrain(rightPwm, -MAX_SPEED, MAX_SPEED));
+}
+
+// 避障控制
+void avoidControl () {
+static enum AvoidSubState {AVOID_CHECK, AVOID_WAIT, AVOID_EXECUTE, AVOID_RECOVER} subState = AVOID_CHECK;
+static unsigned long subStateTime = 0;
+
+switch (subState) {
+case AVOID_CHECK:
+stopAll();
+STM32.print("OBSTACLE,");
+STM32.print(sonarDistance1);
+STM32.print(",");
+STM32.println(sonarDistance2);
+subState = AVOID_WAIT;
+subStateTime = millis();
+break;
+
+case AVOID_WAIT:
+if (avoidDecision.direction != 0) {
+subState = AVOID_EXECUTE;
+subStateTime = millis();
+} else if (millis() - subStateTime > 2000) {
+avoidDecision.direction = (sonarDistance2 > OBSTACLE_THRESHOLD + 10) ? 1 : 3;
+subState = AVOID_EXECUTE;
+subStateTime = millis();
+}
+break;
+
+case AVOID_EXECUTE:
+if (avoidDecision.direction == 1) {
+setMotorSpeed(-100, 100);
+if (millis() - subStateTime > 800) {
+setMotorSpeed(150, 150);
+if (millis() - subStateTime > 1800) subState = AVOID_RECOVER;
+}
+} else if (avoidDecision.direction == 2) {
+setMotorSpeed(100, -100);
+if (millis() - subStateTime > 800) {
+setMotorSpeed(150, 150);
+if (millis() - subStateTime > 1800) subState = AVOID_RECOVER;
+}
+} else {
+setMotorSpeed(-120, -120);
+if (millis() - subStateTime > 1000) subState = AVOID_RECOVER;
+}
+break;
+
+case AVOID_RECOVER:
+stopAll();
+avoidDecision.direction = 0;
+subState = AVOID_CHECK;
+currentSys = (trackFeature.onLineCount > 0) ? previousSysState : SYS_LOST;
+break;
+}
+}
+
+// 丢迹恢复
+void lostRecovery () {
+static unsigned long lostTime = 0;
+static int recoveryStep = 0;
+
+if (recoveryStep == 0) {
+lostTime = millis();
+recoveryStep = 1;
+stopAll();
+STM32.println("REQUEST: FIND_LINE");
+}
+
+if (trajIndex > 50) {
+if (recoveryStep == 1) {
+updateOLED("Back to track...");
+int backIndex = trajIndex - 1;
+while (backIndex > 0 && (trajectory[backIndex].track != TRACK_CROSS && trajectory[backIndex].track != TRACK_STRAIGHT)) backIndex--;
+
+setMotorSpeed(-80, -80);
+recoveryStep = 2;
+} else if (recoveryStep == 2 && millis() - lostTime > 2000) recoveryStep = 3;
+}
+
+if (recoveryStep == 3 || trajIndex <= 50) {
+updateOLED("Searching line...");
+int turnDir = predictTurnDirection();
+
+if (millis() - lostTime > 2000 && millis() - lostTime <= 4000) {
+setMotorSpeed(turnDir > 0 ? 80 : -80, turnDir > 0 ? -80 : 80);
+} else if (millis() - lostTime > 4000) {
+setMotorSpeed(100, 100);
+if (millis() - lostTime > 7000) {
+recoveryStep = 0;
+currentSys = SYS_STOP;
+errorAlert("Line not found");
+}
+}
+}
+
+if (trackFeature.onLineCount > 0) {
+recoveryStep = 0;
+currentSys = SYS_MOVE;
+beep(2, 100);
+}
+}
+
+// 轨迹记录
+void recordTrajectory () {
+if (trajIndex>= TRAJECTORY_MAX) return;
+
+updatePosition();
+trajectory[trajIndex].x = currentX;
+trajectory[trajIndex].y = currentY;
+trajectory[trajIndex].angle = getImuAngleWithCompensation() * DEG_TO_RAD;
+trajectory[trajIndex].time = millis();
+trajectory[trajIndex].track = currentTrack;
+
+trajIndex++;
+if (trajIndex % 100 == 0) {
+STM32.print("TRAJ_SYNC,");
+STM32.println(trajIndex);
+}
+}
+
+/* -------------------------- 通信与交互 -------------------------- */
+// STM32 指令处理
+void processStm32Command (String cmd) {
+cmd.trim ();
+
+if (cmd.startsWith("MODE:")) {
+String mode = cmd.substring(5);
+if (mode == "MOVE") currentSys = SYS_MOVE;
+else if (mode == "TRACK") currentSys = SYS_TRACK;
+else if (mode == "DRAW") currentSys = SYS_DRAW;
+else if (mode == "RECORD") {
+currentSys = SYS_RECORD;
+trajIndex = 0;
+} else if (mode == "STOP") {
+currentSys = SYS_STOP;
+isDrawingPoint = false;
+} else if (mode == "INFO") currentSys = SYS_INFO;
+} else if (cmd.startsWith("AVOID:")) {
+avoidDecision.direction = cmd.substring(6).toInt();
+} else if (cmd.startsWith("DRAW:")) {
+if (currentSys == SYS_DRAW) {
+int comma = cmd.indexOf(',');
+if (comma != -1) {
+targetDrawX = cmd.substring(5, comma).toFloat();
+targetDrawY = cmd.substring(comma+1).toFloat();
+isDrawingPoint = true;
+updateOLED("Move to: X=" + String(targetDrawX,1) + " Y=" + String(targetDrawY,1));
+}
+}
+} else if (cmd == "DRAW:DONE") {
+isDrawingPoint = false;
+beep(1, 50);
+} else if (cmd.startsWith("MOVE:")) {
+if (currentSys == SYS_TRACK) {
+int comma = cmd.indexOf(',');
+if (comma != -1) {
+float x = cmd.substring(5, comma).toFloat();
+float y = cmd.substring(comma+1).toFloat();
+executePreciseMove(x, y);
+}
+}
+}
+}
+
+// 状态上报
+void reportStateToStm32 () {
+STM32.print ("STATE,");
+STM32.print (currentSys);
+STM32.print (",");
+STM32.print (currentX);
+STM32.print (",");
+STM32.print (currentY);
+STM32.print (",");
+STM32.print (getImuAngleWithCompensation ());
+STM32.print (",");
+STM32.print (batteryVoltage);
+STM32.println ();
+}
+
+// 精确移动
+void executePreciseMove (float targetX, float targetY) {
+float dx = targetX - currentX;
+float dy = targetY - currentY;
+float dist = sqrt (dxdx + dydy);
+
+float targetAngle = atan2(dy, dx) * RAD_TO_DEG;
+float angleDiff = targetAngle - getImuAngleWithCompensation();
+angleDiff = (angleDiff > 180) ? angleDiff - 360 : (angleDiff < -180) ? angleDiff + 360 : angleDiff;
+
+if (abs(angleDiff) > 5) {
+controlVars.leftSpeedTarget = (angleDiff > 0) ? -60 : 60;
+controlVars.rightSpeedTarget = (angleDiff > 0) ? 60 : -60;
+} else if (dist > 1.0) {
+controlVars.leftSpeedTarget = TRACK_BASE_SPEED * 0.8;
+controlVars.rightSpeedTarget = TRACK_BASE_SPEED * 0.8;
+} else {
+controlVars.leftSpeedTarget = 0;
+controlVars.rightSpeedTarget = 0;
+STM32.println("REACHED");
+}
+}
+
+// 按钮控制
+void checkModeButton () {
+if (digitalRead (MODE_BUTTON) == LOW && millis () - lastButtonPress > 500) {
+lastButtonPress = millis ();
+currentOledMode = (OledMode)((currentOledMode + 1) % 3);
+beep (1, 50);
+}
+}
+
+// OLED 更新
+void updateOLEDStatus () {
+display.clearDisplay ();
+display.setTextSize (1);
+display.setTextColor (SSD1306_WHITE);
+display.setCursor (0, 0);
+
+switch (currentOledMode) {
+case MODE_COMM:
+display.print("Comm: ");
+bool commOk = (millis() - lastStm32Comm < 1000);
+display.print(commOk ? "OK" : "ERROR");
+
+display.setCursor(0, 16);
+display.print("Last: ");
+display.print((millis() - lastStm32Comm) / 1000);
+display.print("s");
+break;
+
+case MODE_STATE:
+display.print("Sys: ");
+switch (currentSys) {
+case SYS_MOVE: display.print("Move"); break;
+case SYS_TRACK: display.print("Track"); break;
+case SYS_DRAW: display.print("Draw"); break;
+case SYS_AVOID: display.print("Avoid"); break;
+case SYS_LOST: display.print("Lost"); break;
+case SYS_RECORD: display.print("Record"); break;
+case SYS_STOP: display.print("Stop"); break;
+default: display.print("Unknown");
+}
+
+display.setCursor(0, 16);
+display.print("Env: ");
+switch (currentEnv) {
+case ENV_NORMAL: display.print("Normal"); break;
+case ENV_OBSTACLE: display.print("Obstacle"); break;
+case ENV_LOW_BATTERY: display.print("LowBat"); break;
+default: display.print("Other");
+}
+break;
+
+case MODE_TIMER:
+display.print("Run Time");
+display.setCursor(0, 16);
+unsigned long currentTotal = runTimer;
+if (isRunning && timerInitialized) currentTotal += millis() - timerStart;
+display.print(formatTime(currentTotal));
+break;
+}
+
+display.display();
+}
+
+// OLED 文本显示
+void updateOLED (String text) {
+display.clearDisplay ();
+display.setTextSize (1);
+display.setCursor (0, 0);
+display.print (text);
+display.display ();
+}
+
+/* -------------------------- 辅助函数 -------------------------- */
+// 电机控制
+void setMotorSpeed (int leftSpeed, int rightSpeed) {
+leftSpeed = constrain (leftSpeed, -MAX_SPEED, MAX_SPEED);
+rightSpeed = constrain (rightSpeed, -MAX_SPEED, MAX_SPEED);
+
+if (abs(leftSpeed) < 15) leftSpeed = 0;
+if (abs(rightSpeed) < 15) rightSpeed = 0;
+
+if (leftSpeed >= 0) {
+digitalWrite(IN1, HIGH);
+digitalWrite(IN2, LOW);
+analogWrite(PWMA, leftSpeed);
+} else {
+digitalWrite(IN1, LOW);
+digitalWrite(IN2, HIGH);
+analogWrite(PWMA, -leftSpeed);
+}
+
+if (rightSpeed >= 0) {
+digitalWrite(IN3, HIGH);
+digitalWrite(IN4, LOW);
+analogWrite(PWMB, rightSpeed);
+} else {
+digitalWrite(IN3, LOW);
+digitalWrite(IN4, HIGH);
+analogWrite(PWMB, -rightSpeed);
+}
+}
+
+// 停止所有
+void stopAll () {
+setMotorSpeed (0, 0);
+}
+
+// 运行计时
+void updateRunTimer () {
+bool currentRunning = (abs (controlVars.leftSpeedActual) > 10 || abs (controlVars.rightSpeedActual) > 10);
+
+if (currentRunning && !timerInitialized) {
+timerStart = millis();
+timerInitialized = true;
+isRunning = true;
+} else if (!currentRunning && isRunning) {
+runTimer += millis() - timerStart;
+isRunning = false;
+} else if (currentRunning && !isRunning) {
+timerStart = millis();
+isRunning = true;
+}
+}
+
+// 时间格式化
+String formatTime (unsigned long ms) {
+unsigned long sec = ms / 1000;
+unsigned long min = sec / 60;
+ms %= 1000;
+sec %= 60;
+
+return String(min) + ":" + (sec < 10 ? "0" + String(sec) : String(sec)) + "." + String(ms / 100);
+}
+
+// 系统自检
+void systemSelfTest () {
+updateOLED ("Self-testing...");
+
+setMotorSpeed(100, 100);
+delay(500);
+setMotorSpeed(-100, -100);
+delay(500);
+setMotorSpeed(100, -100);
+delay(500);
+stopAll();
+
+updateNonBlockingSensors();
+bool sensorOk = true;
+for (int i = 0; i < 5; i++) {
+if (grayFiltered[i] < 10 || grayFiltered[i] > 1013) sensorOk = false;
+}
+
+if (sensorOk) {
+updateOLED("Self-test OK");
+beep(2, 100);
+} else {
+updateOLED("Sensor error");
+beep(3, 300);
+}
+delay(1000);
+}
+
+// 灰度校准
+void calibrateGraySensor () {
+updateOLED ("Calibrating gray...");
+
+int minVal[5] = {1024, 1024, 1024, 1024, 1024};
+int maxVal[5] = {0, 0, 0, 0, 0};
+
+setMotorSpeed(80, 80);
+for (int i = 0; i < 50; i++) {
+for (int j = 0; j < 5; j++) {
+int val = analogRead(GRAY_PINS[j]);
+minVal[j] = min(minVal[j], val);
+maxVal[j] = max(maxVal[j], val);
+}
+delay(20);
+}
+stopAll();
+
+int tempThreshold = 0;
+for (int j = 0; j < 5; j++) {
+tempThreshold += (minVal[j] + maxVal[j]) * 0.55;
+}
+grayThreshold = tempThreshold / 5;
+
+updateOLED("Gray calib done");
+delay(500);
+}
+
+// 编码器校准
+void calibrateEncoder () {
+updateOLED ("Calibrating enc...");
+
+leftEnc.write(0);
+rightEnc.write(0);
+long startLeft = leftEnc.read();
+long startRight = rightEnc.read();
+
+setMotorSpeed(100, 100);
+delay(2000);
+stopAll();
+delay(500);
+
+long endLeft = leftEnc.read();
+long endRight = rightEnc.read();
+long avgPulse = (endLeft - startLeft + endRight - startRight) / 2;
+float actualPulsePerCm = avgPulse / 50.0;
+
+updateOLED("Encoder done");
+delay(500);
+}
+
+// 蜂鸣器
+void beep (int count, int duration) {
+for (int i = 0; i < count; i++) {
+digitalWrite (BUZZER_PIN, HIGH);
+delay (duration);
+digitalWrite (BUZZER_PIN, LOW);
+if (i < count - 1) {
+delay (duration / 2);
+}
+}
+}
+
+// 错误警报
+void errorAlert (String message) {
+digitalWrite (LED_ERROR, HIGH);
+beep (3, 500);
+
+#ifdef DEBUG_MODE
+Serial.println("ERROR: " + message);
+#endif
+
+updateOLED("Error: " + message);
+digitalWrite(LED_ERROR, LOW);
+}
+
+// 计算轨迹误差
+float calculateTrackError () {
+float weightedSum = 0;
+int weightCount = 0;
+
+// 对每个在线传感器赋予权重（中间大两边小）
+for (int i = 0; i < 5; i++) {
+if (grayFiltered [i] > grayThreshold) {
+int weight = 5 - abs (i - 2); // 中间传感器权重最高
+weightedSum += (i * 100 - 200) * weight; // 转换为偏移量
+weightCount += weight;
+}
+}
+
+// 无传感器在线时使用 IMU 保持方向
+if (weightCount == 0) {
+static float lastValidError = 0;
+float angleDiff = getImuAngleWithCompensation () - lastAngle;
+lastValidError += angleDiff * 5; // 角度转换为误差等效值
+return constrain (lastValidError, -500, 500);
+}
+
+float error = weightedSum / weightCount;
+
+// 加入历史平滑
+static float errorSmooth = 0;
+errorSmooth = 0.7 * errorSmooth + 0.3 * error;
+
+return errorSmooth;
+}
+
+// 预测转向方向（丢线时使用）
+int predictTurnDirection () {
+// 分析最后 10 个轨迹状态
+int rightTurns = 0, leftTurns = 0;
+for (int i = 0; i < 10; i++) {
+int histIndex = (historyIndex + 15 - i) % 15;
+if (trackHistory [histIndex] == TRACK_RIGHT_ANGLE || trackHistory [histIndex] == TRACK_SHARP_RIGHT) {
+rightTurns++;
+} else if (trackHistory [histIndex] == TRACK_LEFT_ANGLE || trackHistory [histIndex] == TRACK_SHARP_LEFT) {
+leftTurns++;
+}
+}
+
+// 优先按历史轨迹方向搜索
+if (rightTurns> leftTurns) return 1; // 右
+if (leftTurns > rightTurns) return -1; // 左
+
+// 无历史默认右
+return 1;
+}
+
+// 调试日志（默认不实现，根据需要添加）
+void logDebugData () {
+// 示例：输出关键控制参数
+/*
+Serial.print ("Error:");
+Serial.print (controlVars.trackError);
+Serial.print ("L:");
+Serial.print (controlVars.leftSpeedTarget);
+Serial.print ("R:");
+Serial.println (controlVars.rightSpeedTarget);
+*/
+}
